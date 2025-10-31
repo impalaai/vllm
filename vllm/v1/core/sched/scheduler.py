@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -160,6 +161,25 @@ class Scheduler(SchedulerInterface):
             enable_kv_cache_events=self.enable_kv_cache_events,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        
+        # KV cache blocking threshold from environment variable
+        # Default to 0.9 (90%) if not set or invalid
+        print("\n\n\nKV_BLOCKOFF: ", os.environ.get("KV_BLOCKOFF", "0.9"))
+        try:
+            kv_blockoff = float(os.environ.get("KV_BLOCKOFF", "0.9"))
+            if not 0.0 <= kv_blockoff <= 1.0:
+                logger.warning(
+                    "Invalid KV_BLOCKOFF value: %f. Must be between 0.0 and 1.0. "
+                    "Using default 0.9", kv_blockoff)
+                kv_blockoff = 0.9
+        except (ValueError, TypeError):
+            logger.warning(
+                "Invalid KV_BLOCKOFF environment variable. Using default 0.9")
+            kv_blockoff = 0.9
+        
+        self.kv_blockoff_threshold = kv_blockoff
+        logger.info("KV cache blocking threshold set to %.1f%%", 
+                    self.kv_blockoff_threshold * 100)
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -327,9 +347,26 @@ class Scheduler(SchedulerInterface):
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
 
+        # Check KV cache utilization before scheduling new prompts
+        kv_cache_util = self.kv_cache_manager.usage
+        if kv_cache_util > self.kv_blockoff_threshold and self.waiting:
+
+            if not self.printed_warning:
+                logger.debug(
+                    "Blocking new prompt scheduling: KV cache utilization %.1f%% > %.1f%% threshold. "
+                    "Running requests: %d, Waiting requests: %d",
+                    kv_cache_util * 100, self.kv_blockoff_threshold * 100, 
+                    len(self.running), len(self.waiting))
+                self.printed_warning = True
+        else:
+            if hasattr(self, "printed_warning") and self.printed_warning:
+                logger.debug("KV cache utilization is below threshold. Allowing new prompt scheduling.")
+            self.printed_warning = False
+            
         # Next, schedule the WAITING requests.
-        if not preempted_reqs:
-            while self.waiting and token_budget > 0:
+        # Block new prompts (including preempted requests) when KV cache utilization exceeds threshold
+        if not preempted_reqs :
+            while self.waiting and token_budget > 0 and self.kv_cache_manager.usage  <= self.kv_blockoff_threshold:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -521,6 +558,33 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+        # Track the running maximum of total_num_scheduled_tokens and print when exceeded
+        if not hasattr(self, "_scheduling_iter_count"):
+            self._scheduling_iter_count = 0
+        self._scheduling_iter_count += 1
+
+        if not hasattr(self, "_running_max_scheduled_tokens"):
+            self._running_max_scheduled_tokens = 0
+
+        # Running mean of total_num_scheduled_tokens
+        if not hasattr(self, "_running_sum_scheduled_tokens"):
+            self._running_sum_scheduled_tokens = 0
+        self._running_sum_scheduled_tokens += total_num_scheduled_tokens
+
+        running_mean_scheduled_tokens = self._running_sum_scheduled_tokens / self._scheduling_iter_count
+
+        # Print info every 100 iters
+        if self._scheduling_iter_count % 100 == 0:
+            logger.info(f"[Scheduler] Iter {self._scheduling_iter_count}: num_batched_tokens={total_num_scheduled_tokens}")
+            logger.info(f"[Scheduler] Iter {self._scheduling_iter_count}: running mean num_batched_tokens={running_mean_scheduled_tokens:.2f}")
+
+        # Print when running max is exceeded
+        if total_num_scheduled_tokens > self._running_max_scheduled_tokens:
+            self._running_max_scheduled_tokens = total_num_scheduled_tokens
+            logger.info(f"[Scheduler] New running max num_batched_tokens={total_num_scheduled_tokens} at iteration {self._scheduling_iter_count}")
+            logger.info(f"[Scheduler] Running mean num_batched_tokens at new max: {running_mean_scheduled_tokens:.2f}")
+            self._scheduling_iter_count = 0
+            self._running_sum_scheduled_tokens = 0
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
