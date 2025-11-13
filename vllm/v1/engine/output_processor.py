@@ -4,7 +4,7 @@
 import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Optional, Union, cast
+from typing import Any, Callable, Optional, Union, cast
 
 import torch
 
@@ -278,12 +278,19 @@ class OutputProcessor:
         self,
         tokenizer: TokenizerGroup,
         log_stats: bool,
+        request_finished_callback: Optional[Callable[[str], None]] = None,
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
         self.request_states: dict[str, RequestState] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
         self.lora_states = LoRARequestStates()
+        self._request_finished_callback = request_finished_callback
+
+    def _notify_request_finished(self, request_id: str) -> None:
+        if self._request_finished_callback is None:
+            return
+        self._request_finished_callback(request_id)
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
@@ -313,6 +320,7 @@ class OutputProcessor:
                         request_output := req_state.make_request_output(
                             [], None, FinishReason.ABORT, None, None)):
                     req_state.queue.put(request_output)
+                self._notify_request_finished(request_id)
             elif parent := self.parent_requests.get(request_id):
                 # Abort children prior to removing the parent.
                 if parent.child_requests:
@@ -429,6 +437,7 @@ class OutputProcessor:
             # Free completed requests.
             if finish_reason is not None:
                 self.request_states.pop(req_id)
+                self._notify_request_finished(req_id)
                 # Remove parent request if applicable.
                 parent_req = req_state.parent_req
                 if parent_req and not parent_req.child_requests:

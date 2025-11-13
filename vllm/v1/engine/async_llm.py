@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import os
 import time
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
@@ -42,6 +43,9 @@ from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
 
 logger = init_logger(__name__)
+
+_WAITING_QUEUE_ENV = "VLLM_V1_WAITING_QUEUE_LIMIT"
+_DEFAULT_WAITING_QUEUE_LIMIT = 2048
 
 
 class AsyncLLM(EngineClient):
@@ -95,6 +99,12 @@ class AsyncLLM(EngineClient):
         self.vllm_config = vllm_config
         self.log_requests = log_requests
         self.log_stats = log_stats
+        self._waiting_queue_limit = self._determine_waiting_queue_limit()
+        self._waiting_queue_limiter = (asyncio.Semaphore(
+            self._waiting_queue_limit)
+                                       if self._waiting_queue_limit else None)
+        self._pending_waiting_requests: set[str] = set()
+        self._staging_queue_size: int = 0
 
         if self.model_config.skip_tokenizer_init:
             self.tokenizer = None
@@ -113,8 +123,11 @@ class AsyncLLM(EngineClient):
         )
 
         # OutputProcessor (converts EngineCoreOutputs --> RequestOutput).
-        self.output_processor = OutputProcessor(self.tokenizer,
-                                                log_stats=self.log_stats)
+        self.output_processor = OutputProcessor(
+            self.tokenizer,
+            log_stats=self.log_stats,
+            request_finished_callback=self._on_engine_request_finished,
+        )
 
         # EngineCore (starts the engine in background process).
         self.engine_core = EngineCoreClient.make_async_mp_client(
@@ -143,6 +156,56 @@ class AsyncLLM(EngineClient):
             self._run_output_handler()
         except RuntimeError:
             pass
+
+    def _determine_waiting_queue_limit(self) -> Optional[int]:
+        scheduler_limit = getattr(self.vllm_config.scheduler_config,
+                                  "waiting_queue_limit", None)
+        if scheduler_limit is not None:
+            return scheduler_limit or None
+
+        env_value = os.getenv(_WAITING_QUEUE_ENV)
+        if env_value is None:
+            return _DEFAULT_WAITING_QUEUE_LIMIT
+        env_value = env_value.strip()
+        if not env_value:
+            return _DEFAULT_WAITING_QUEUE_LIMIT
+        try:
+            limit = int(env_value)
+        except ValueError as exc:
+            raise ValueError(
+                f"{_WAITING_QUEUE_ENV} must be an integer, got: {env_value!r}"
+            ) from exc
+        if limit <= 0:
+            return None
+        return limit
+
+    async def _await_waiting_slot(self, request_id: str) -> None:
+        limiter = self._waiting_queue_limiter
+        if limiter is None:
+            return
+        self._staging_queue_size += 1
+        try:
+            await limiter.acquire()
+        finally:
+            self._staging_queue_size -= 1
+        self._pending_waiting_requests.add(request_id)
+
+    def _release_waiting_slot(self, request_id: str) -> None:
+        limiter = self._waiting_queue_limiter
+        if limiter is None:
+            return
+        if request_id not in self._pending_waiting_requests:
+            return
+        self._pending_waiting_requests.remove(request_id)
+        limiter.release()
+
+    def _on_engine_request_finished(self, request_id: str) -> None:
+        self._release_waiting_slot(request_id)
+
+    def _get_staging_queue_size(self) -> int:
+        if self._waiting_queue_limiter is None:
+            return 0
+        return max(self._staging_queue_size, 0)
 
     @classmethod
     @deprecate_kwargs(
@@ -272,12 +335,17 @@ class AsyncLLM(EngineClient):
                            parent_req: Optional[ParentRequest], index: int,
                            queue: RequestOutputCollector):
 
+        await self._await_waiting_slot(request.request_id)
         # Add the request to OutputProcessor (this process).
-        self.output_processor.add_request(request, prompt, parent_req, index,
-                                          queue)
+        try:
+            self.output_processor.add_request(request, prompt, parent_req,
+                                              index, queue)
 
-        # Add the EngineCoreRequest to EngineCore (separate process).
-        await self.engine_core.add_request_async(request)
+            # Add the EngineCoreRequest to EngineCore (separate process).
+            await self.engine_core.add_request_async(request)
+        except Exception:
+            self._release_waiting_slot(request.request_id)
+            raise
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
@@ -421,9 +489,13 @@ class AsyncLLM(EngineClient):
                     # TODO(rob): make into a coroutine and launch it in
                     # background thread once Prometheus overhead is non-trivial.
                     if logger_manager:
+                        scheduler_stats = outputs.scheduler_stats
+                        if scheduler_stats is not None:
+                            scheduler_stats.num_staging_reqs = (
+                                self._get_staging_queue_size())
                         logger_manager.record(
                             engine_idx=outputs.engine_index,
-                            scheduler_stats=outputs.scheduler_stats,
+                            scheduler_stats=scheduler_stats,
                             iteration_stats=iteration_stats,
                         )
             except Exception as e:

@@ -125,6 +125,7 @@ class LoggingStatLogger(StatLoggerBase):
             "Avg prompt throughput: %.1f tokens/s, "
             "Avg generation throughput: %.1f tokens/s, "
             "Running: %d reqs, Waiting: %d reqs, "
+            "Staging: %d reqs, "
             "GPU KV cache usage: %.1f%%, "
             "Prefix cache hit rate: %.1f%%",
             self.engine_index,
@@ -132,6 +133,7 @@ class LoggingStatLogger(StatLoggerBase):
             generation_throughput,
             scheduler_stats.num_running_reqs,
             scheduler_stats.num_waiting_reqs,
+            scheduler_stats.num_staging_reqs,
             scheduler_stats.kv_cache_usage * 100,
             self.prefix_caching_metrics.hit_rate * 100,
         )
@@ -202,6 +204,14 @@ class PrometheusStatLogger(StatLoggerBase):
         self.gauge_scheduler_waiting = make_per_engine(gauge_scheduler_waiting,
                                                        engine_indexes,
                                                        model_name)
+
+        gauge_scheduler_staging = self._gauge_cls(
+            name="vllm:num_requests_staging",
+            documentation="Number of requests queued in the staging layer.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames)
+        self.gauge_scheduler_staging = make_per_engine(
+            gauge_scheduler_staging, engine_indexes, model_name)
 
         #
         # GPU cache
@@ -497,6 +507,8 @@ class PrometheusStatLogger(StatLoggerBase):
                 scheduler_stats.num_running_reqs)
             self.gauge_scheduler_waiting[engine_idx].set(
                 scheduler_stats.num_waiting_reqs)
+            self.gauge_scheduler_staging[engine_idx].set(
+                scheduler_stats.num_staging_reqs)
 
             self.gauge_gpu_cache_usage[engine_idx].set(
                 scheduler_stats.kv_cache_usage)
