@@ -38,6 +38,7 @@ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import _SAMPLING_EPS
+from vllm.v1.spec_decode import _instrumentation
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
@@ -404,11 +405,31 @@ class SpecDecodeBaseProposer:
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)
 
-    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Greedy-sample draft tokens from hidden states."""
+    def _greedy_sample(
+        self,
+        hidden_states: torch.Tensor,
+        position: int = 0,
+    ) -> torch.Tensor:
+        """Greedy-sample draft tokens from hidden states.
+
+        ``position`` is the 0-indexed draft position within the chain
+        (or 0 for parallel-drafting / single-token modes). It is only
+        consumed by the offline calibration tracer; behavior is bitwise
+        identical to upstream when the tracer is disabled.
+        """
         if self.use_local_argmax_reduction:
+            # The local-argmax-reduction path collapses logits inside the
+            # model and never returns the full vocabulary distribution,
+            # so per-position gap is unavailable here. The tracer simply
+            # skips this batch — the calibration notebook treats absent
+            # gaps as missing data, not as gap=0.
             return self.model.get_top_tokens(hidden_states)
-        return self.model.compute_logits(hidden_states).argmax(dim=-1)
+        logits = self.model.compute_logits(hidden_states)
+        tracer = _instrumentation.get_tracer()
+        if tracer is not None and logits.size(-1) >= 2:
+            gap = _instrumentation.compute_top1_top2_gap(logits)
+            tracer.record_gaps(gap.cpu().numpy(), position=position)
+        return logits.argmax(dim=-1)
 
     def propose(
         self,
@@ -647,7 +668,10 @@ class SpecDecodeBaseProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
+            draft_token_ids = self._greedy_sample(
+                last_hidden_states[:batch_size],
+                position=token_index + 1,
+            )
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]

@@ -128,6 +128,11 @@ if TYPE_CHECKING:
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
+    # Passive instrumentation for offline P(accept | gap) calibration.
+    # See vllm/v1/spec_decode/_instrumentation.py.
+    VLLM_SPEC_GATE_TRACE: bool = False
+    VLLM_SPEC_GATE_TRACE_DIR: str = "/tmp/vllm-spec-gate-trace"
+    VLLM_SPEC_GATE_TRACE_FLUSH_EVERY: int = 4096
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_USE_LAYERNAME: bool = True
     Q_SCALE_CONSTANT: int = 200
@@ -707,6 +712,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         val
         if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10."))) > 0.0
         else 10.0
+    ),
+    # If set to 1, dump (logit_gap, accept) tuples through the speculative-
+    # decode path for offline P(accept | gap) calibration. No-op otherwise.
+    # See vllm/v1/spec_decode/_instrumentation.py.
+    "VLLM_SPEC_GATE_TRACE": lambda: bool(int(os.getenv("VLLM_SPEC_GATE_TRACE", "0"))),
+    # Directory to write spec-gate trace shards into. Created if missing.
+    "VLLM_SPEC_GATE_TRACE_DIR": lambda: os.getenv(
+        "VLLM_SPEC_GATE_TRACE_DIR", "/tmp/vllm-spec-gate-trace"
+    ),
+    # Flush trace buffer to disk every N draft rows.
+    "VLLM_SPEC_GATE_TRACE_FLUSH_EVERY": lambda: int(
+        os.getenv("VLLM_SPEC_GATE_TRACE_FLUSH_EVERY", "4096")
     ),
     # Trace function calls
     # If set to 1, vllm will trace function calls

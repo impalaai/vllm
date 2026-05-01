@@ -1561,6 +1561,14 @@ class Scheduler(SchedulerInterface):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
+        # Advance the spec-gate trace step counter once per scheduler step.
+        # No-op when VLLM_SPEC_GATE_TRACE is unset.
+        from vllm.v1.spec_decode import _instrumentation as _spec_gate_trace
+
+        _spec_gate_trace_tracer = _spec_gate_trace.get_tracer()
+        if _spec_gate_trace_tracer is not None:
+            _spec_gate_trace_tracer.step_boundary()
+
         return engine_core_outputs
 
     @staticmethod
@@ -1991,6 +1999,19 @@ class Scheduler(SchedulerInterface):
         spec_decoding_stats.observe_draft(
             num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
         )
+        # Passive instrumentation for offline P(accept | gap) calibration.
+        # No-op when VLLM_SPEC_GATE_TRACE is unset; see
+        # vllm/v1/spec_decode/_instrumentation.py.
+        from vllm.v1.spec_decode import _instrumentation as _spec_gate_trace
+
+        tracer = _spec_gate_trace.get_tracer()
+        if tracer is not None:
+            tracer.record_acceptance(
+                request_id=request_id,
+                batch_idx=-1,  # batch_idx is reconstructed offline by step join
+                num_drafted=num_draft_tokens,
+                num_accepted=num_accepted_tokens,
+            )
         return spec_decoding_stats
 
     def shutdown(self) -> None:

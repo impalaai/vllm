@@ -10,6 +10,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models.interfaces import is_mixture_of_experts
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.spec_decode import _instrumentation
 
 # Initialize logger
 logger = init_logger(__name__)
@@ -47,6 +48,13 @@ class MedusaProposer:
         # Generate blocks and compute logits
         blocks = self.model(target_hidden_states)
         logits = self.model.compute_logits(blocks)
+
+        tracer = _instrumentation.get_tracer()
+        if tracer is not None:
+            for head_idx, head_logits in enumerate(logits):
+                if head_logits.size(-1) >= 2:
+                    gap = _instrumentation.compute_top1_top2_gap(head_logits)
+                    tracer.record_gaps(gap.cpu().numpy(), position=head_idx)
 
         # Compute argmax for each Medusa head and stack into a single tensor
         # Shape: [batch_size, num_heads]
