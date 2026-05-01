@@ -3,17 +3,20 @@
 import dataclasses
 import os
 import traceback
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any, Concatenate
 
 import torch
-from torch.multiprocessing import (
-    spawn)  # pyright: ignore[reportPrivateImportUsage]
-from typing_extensions import Concatenate, ParamSpec
+from torch.multiprocessing import spawn  # pyright: ignore[reportPrivateImportUsage]
+from typing_extensions import ParamSpec
 
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.distributed import (init_distributed_environment,
-                              initialize_model_parallel)
-from vllm.utils import get_open_port
+from vllm.distributed import (
+    cleanup_dist_env_and_memory,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
+from vllm.utils.network_utils import get_open_port
 
 ## Parallel Processes Utils
 
@@ -30,29 +33,34 @@ class ProcessGroupInfo:
     device: torch.device
 
 
-def _set_vllm_config(vllm_config: VllmConfig, world_size: int, rank: int,
-                     local_rank: int):
-
+def _set_vllm_config(
+    vllm_config: VllmConfig, world_size: int, rank: int, local_rank: int
+):
     import tempfile
+
     temp_file = tempfile.mkstemp()[1]
+
+    # When DP is enabled, processes are organized as:
+    #  rank = dp_rank * tp_pp_world_size + tp_pp_rank
+    tp_pp_world_size = vllm_config.parallel_config.world_size
+    vllm_config.parallel_config.data_parallel_rank = rank // tp_pp_world_size
+    tp_pp_rank = rank % tp_pp_world_size
+    vllm_config.parallel_config.rank = tp_pp_rank
 
     with set_current_vllm_config(vllm_config):
         init_distributed_environment(
-            world_size=world_size,
-            rank=rank,
+            world_size=tp_pp_world_size,
+            rank=tp_pp_rank,
             distributed_init_method=f"file://{temp_file}",
             local_rank=local_rank,
             backend="nccl",
         )
 
         initialize_model_parallel(
-            tensor_model_parallel_size=vllm_config.parallel_config.
-            tensor_parallel_size,
-            pipeline_model_parallel_size=vllm_config.parallel_config.
-            pipeline_parallel_size,
+            tensor_model_parallel_size=vllm_config.parallel_config.tensor_parallel_size,
+            pipeline_model_parallel_size=vllm_config.parallel_config.pipeline_parallel_size,
         )
-        cpu_group = torch.distributed.new_group(list(range(world_size)),
-                                                backend="gloo")
+        cpu_group = torch.distributed.new_group(list(range(world_size)), backend="gloo")
     return cpu_group
 
 
@@ -62,16 +70,15 @@ def _worker_parallel_launch(
     world_local_size: int,
     node_rank: int,
     init_method: str,
-    worker: Callable[Concatenate[ProcessGroupInfo, Optional[VllmConfig], Any,
-                                 P], None],
-    vllm_config: Optional[VllmConfig],
-    env_dict: Optional[dict],
-    *args: P.args,
-    **kwargs: P.kwargs,
+    worker: Callable[..., None],
+    vllm_config: VllmConfig | None,
+    env_dict: dict | None,
+    worker_kwargs: dict[str, Any],
+    *args: Any,
 ) -> None:
     rank = node_rank * world_local_size + local_rank
-    torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
+    torch.accelerator.set_device_index(device)
     torch.distributed.init_process_group(
         backend="cpu:gloo,cuda:nccl",
         init_method=init_method,
@@ -102,25 +109,27 @@ def _worker_parallel_launch(
             vllm_config,
             cpu_group,
             *args,
-            **kwargs,
+            **worker_kwargs,
         )
     except Exception as ex:
         print(ex)
         traceback.print_exc()
         raise
     finally:
-        torch.distributed.destroy_process_group()
+        if vllm_config is not None:
+            cleanup_dist_env_and_memory()
+        else:
+            torch.distributed.destroy_process_group()
 
 
 def parallel_launch_with_config(
     world_size: int,
     worker: Callable[Concatenate[ProcessGroupInfo, VllmConfig, Any, P], None],
     vllm_config: VllmConfig,
-    env_dict: dict[Any, Any],
+    env_dict: dict[Any, Any] | None,
     *args: P.args,
     **kwargs: P.kwargs,
 ) -> None:
-    assert not kwargs
     spawn(
         _worker_parallel_launch,
         args=(
@@ -131,7 +140,9 @@ def parallel_launch_with_config(
             worker,
             vllm_config,
             env_dict,
-        ) + args,
+            kwargs,
+        )
+        + args,
         nprocs=world_size,
         join=True,
     )

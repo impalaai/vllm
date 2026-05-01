@@ -8,126 +8,16 @@ the explicit/implicit prompt format on enc-dec LMMs for text generation.
 import os
 import time
 from collections.abc import Sequence
-from dataclasses import asdict
 from typing import NamedTuple
 
 from vllm import LLM, EngineArgs, PromptType, SamplingParams
 from vllm.assets.audio import AudioAsset
-from vllm.assets.image import ImageAsset
-from vllm.multimodal.utils import fetch_image
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
 class ModelRequestData(NamedTuple):
     engine_args: EngineArgs
     prompts: Sequence[PromptType]
-
-
-def run_donut():
-    engine_args = EngineArgs(
-        model="naver-clova-ix/donut-base-finetuned-docvqa",
-        max_num_seqs=2,
-        limit_mm_per_prompt={"image": 1},
-        dtype="float16",
-        hf_overrides={"architectures": ["DonutForConditionalGeneration"]},
-    )
-
-    # The input image size for donut-base-finetuned-docvqa is 2560 x 1920,
-    # and the patch_size is 4 x 4.
-    # Therefore, the initial number of patches is:
-    # Height: 1920 / 4 = 480 patches
-    # Width: 2560 / 4 = 640 patches
-    # The Swin model uses a staged downsampling approach,
-    # defined by the "depths": [2, 2, 14, 2] configuration.
-    # Before entering stages 2, 3, and 4, a "Patch Merging" operation is performed,
-    # which halves the feature map's dimensions (dividing both height and width by 2).
-    # Before Stage 2: The size changes from 480 x 640 to (480/2) x (640/2) = 240 x 320.
-    # Before Stage 3: The size changes from 240 x 320 to (240/2) x (320/2) = 120 x 160.
-    # Before Stage 4: The size changes from 120 x 160 to (120/2) x (160/2) = 60 x 80.
-    # Because vLLM needs to fill the image features with an encoder_prompt,
-    # and the encoder_prompt will have `<pad>` tokens added when tokenized,
-    # we need to construct an encoder_prompt with a length of 60 x 80 - 1 = 4799.
-    prompts = [
-        {
-            "encoder_prompt": {
-                "prompt": "".join(["$"] * 4799),
-                "multi_modal_data": {
-                    "image": fetch_image(
-                        "https://huggingface.co/datasets/hf-internal-testing/example-documents/resolve/main/jpeg_images/0.jpg"
-                    )  # noqa: E501
-                },
-            },
-            "decoder_prompt": "<s_docvqa><s_question>What time is the coffee break?</s_question><s_answer>",  # noqa: E501
-        },
-    ]
-
-    return ModelRequestData(
-        engine_args=engine_args,
-        prompts=prompts,
-    )
-
-
-def run_florence2():
-    engine_args = EngineArgs(
-        model="microsoft/Florence-2-large",
-        tokenizer="Isotr0py/Florence-2-tokenizer",
-        max_num_seqs=8,
-        trust_remote_code=True,
-        limit_mm_per_prompt={"image": 1},
-        dtype="half",
-    )
-
-    prompts = [
-        {  # implicit prompt with task token
-            "prompt": "<DETAILED_CAPTION>",
-            "multi_modal_data": {"image": ImageAsset("stop_sign").pil_image},
-        },
-        {  # explicit encoder/decoder prompt
-            "encoder_prompt": {
-                "prompt": "Describe in detail what is shown in the image.",
-                "multi_modal_data": {"image": ImageAsset("cherry_blossom").pil_image},
-            },
-            "decoder_prompt": "",
-        },
-    ]
-
-    return ModelRequestData(
-        engine_args=engine_args,
-        prompts=prompts,
-    )
-
-
-def run_mllama():
-    engine_args = EngineArgs(
-        model="meta-llama/Llama-3.2-11B-Vision-Instruct",
-        max_model_len=8192,
-        max_num_seqs=2,
-        limit_mm_per_prompt={"image": 1},
-        dtype="half",
-    )
-
-    prompts = [
-        {  # Implicit prompt
-            "prompt": "<|image|><|begin_of_text|>What is the content of this image?",  # noqa: E501
-            "multi_modal_data": {
-                "image": ImageAsset("stop_sign").pil_image,
-            },
-        },
-        {  # Explicit prompt
-            "encoder_prompt": {
-                "prompt": "<|image|>",
-                "multi_modal_data": {
-                    "image": ImageAsset("stop_sign").pil_image,
-                },
-            },
-            "decoder_prompt": "<|image|><|begin_of_text|>Please describe the image.",  # noqa: E501
-        },
-    ]
-
-    return ModelRequestData(
-        engine_args=engine_args,
-        prompts=prompts,
-    )
 
 
 def run_whisper():
@@ -165,10 +55,91 @@ def run_whisper():
     )
 
 
+def run_fireredasr2():
+    """
+    FireRedASR2 – Automatic Speech Recognition model.
+
+    This model uses a Conformer encoder + Qwen2 LLM decoder architecture
+    for speech-to-text transcription.  Audio is passed via the implicit
+    prompt format with the ``<|AUDIO|>`` placeholder token.
+    """
+    engine_args = EngineArgs(
+        model="allendou/FireRedASR2-LLM-vllm",
+        max_model_len=448,
+        max_num_seqs=16,
+        limit_mm_per_prompt={"audio": 1},
+    )
+
+    prompt_str = (
+        "<|im_start|>user\n<|AUDIO|>请转写音频为文字<|im_end|>\n<|im_start|>assistant\n"
+    )
+
+    prompts = [
+        {  # Implicit prompt with audio
+            "prompt": prompt_str,
+            "multi_modal_data": {
+                "audio": AudioAsset("mary_had_lamb").audio_and_sample_rate,
+            },
+        },
+        {  # Another audio sample
+            "prompt": prompt_str,
+            "multi_modal_data": {
+                "audio": AudioAsset("winning_call").audio_and_sample_rate,
+            },
+        },
+    ]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
+def run_fireredlid():
+    """
+    FireRedLID – Language Identification model.
+
+    This encoder-decoder model identifies the spoken language of an audio
+    clip. It outputs at most 2 tokens representing the detected language
+    (e.g. "en", "zh mandarin").
+    """
+    engine_args = EngineArgs(
+        model="PatchyTisa/FireRedLID-vllm",
+        max_model_len=8,
+        max_num_seqs=16,
+        limit_mm_per_prompt={"audio": 1},
+    )
+
+    prompts = [
+        {  # Test explicit encoder/decoder prompt
+            "encoder_prompt": {
+                "prompt": "",
+                "multi_modal_data": {
+                    "audio": AudioAsset("mary_had_lamb").audio_and_sample_rate,
+                },
+            },
+            "decoder_prompt": "<sos>",
+        },
+        {  # Another audio sample
+            "encoder_prompt": {
+                "prompt": "",
+                "multi_modal_data": {
+                    "audio": AudioAsset("winning_call").audio_and_sample_rate,
+                },
+            },
+            "decoder_prompt": "<sos>",
+        },
+    ]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+    )
+
+
 model_example_map = {
-    "donut": run_donut,
-    "florence2": run_florence2,
-    "mllama": run_mllama,
+    "fireredasr2": run_fireredasr2,
+    "fireredlid": run_fireredlid,
     "whisper": run_whisper,
 }
 
@@ -182,14 +153,14 @@ def parse_args():
         "--model-type",
         "-m",
         type=str,
-        default="mllama",
+        default="whisper",
         choices=model_example_map.keys(),
         help='Huggingface "model_type".',
     )
     parser.add_argument(
         "--seed",
         type=int,
-        default=None,
+        default=0,
         help="Set the seed when initializing `vllm.LLM`.",
     )
     return parser.parse_args()
@@ -203,13 +174,12 @@ def main(args):
     req_data = model_example_map[model]()
 
     # Disable other modalities to save memory
+    engine_args = req_data.engine_args
     default_limits = {"image": 0, "video": 0, "audio": 0}
-    req_data.engine_args.limit_mm_per_prompt = default_limits | dict(
-        req_data.engine_args.limit_mm_per_prompt or {}
-    )
-
-    engine_args = asdict(req_data.engine_args) | {"seed": args.seed}
-    llm = LLM(**engine_args)
+    limit_mm_per_prompt = default_limits | (engine_args.limit_mm_per_prompt or {})
+    engine_args.limit_mm_per_prompt = limit_mm_per_prompt
+    engine_args.seed = args.seed
+    llm = LLM.from_engine_args(engine_args)
 
     prompts = req_data.prompts
 
