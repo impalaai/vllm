@@ -79,6 +79,8 @@ class BaseModelLoader(ABC):
 
             process_weights_after_loading(model, model_config, target_device)
 
+            _impala_weight_checksum(model)
+
         return model.eval()
 
 
@@ -99,3 +101,77 @@ def _has_online_quant(model: nn.Module):
             return True
 
     return False
+
+
+def _impala_weight_checksum(model: nn.Module) -> None:
+    """Experiment 4 (Impala): IMPALA_WEIGHT_CHECKSUM=<dir> -> write a per-rank report hashing every GPU parameter/buffer
+    (64-bit position-mixed sum on the device) plus sha256 of a fixed sample, after process_weights_after_loading."""
+    import hashlib
+    import json
+    import os
+    import time
+
+    out_dir = os.environ.get("IMPALA_WEIGHT_CHECKSUM")
+    if not out_dir:
+        return
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    t0 = time.time()
+    rank = get_tensor_model_parallel_rank()
+    items = [(n, p.data) for n, p in model.named_parameters()]
+    items += [(n, b) for n, b in model.named_buffers()]
+    items.sort(key=lambda kv: kv[0])
+    mask = (1 << 64) - 1
+    chunk = 1 << 26
+    res: dict[str, dict] = {}
+    total = 0
+    for name, t in items:
+        entry = {"shape": list(t.shape), "dtype": str(t.dtype), "dev": str(t.device)}
+        if t.device.type == "cuda" and t.numel() > 0:
+            u8 = t.detach().contiguous().view(-1).view(torch.uint8)
+            nb = u8.numel()
+            pad = (-nb) % 8
+            if pad:
+                u8 = torch.cat([u8, torch.zeros(pad, dtype=torch.uint8, device=u8.device)])
+            x = u8.view(torch.int64)
+            h = 0
+            for off in range(0, x.numel(), chunk):
+                c = x[off : off + chunk]
+                idx = torch.arange(off, off + c.numel(), device=c.device, dtype=torch.int64)
+                h = (h + int(((c * 0x5BD1E995) ^ (idx * 0x1B873593)).sum().item())) & mask
+            entry["nbytes"] = nb
+            entry["h64"] = f"{h:016x}"
+            total += nb
+        res[name] = entry
+    names = [n for n, t in items if t.device.type == "cuda" and t.numel() > 0]
+    k = max(1, len(names) // 20)
+    chosen = list(dict.fromkeys(names[::k][:20] + [n for n in names if "scale" in n][:6]))
+    by_name = dict(items)
+    sample = {}
+    for n in chosen:
+        t = by_name[n]
+        sample[n] = hashlib.sha256(
+            t.detach().contiguous().view(-1).view(torch.uint8).cpu().numpy().tobytes()
+        ).hexdigest()
+    digest = hashlib.sha256(json.dumps(res, sort_keys=True).encode()).hexdigest()
+    report = {
+        "rank": rank,
+        "pid": os.getpid(),
+        "n_tensors": len(res),
+        "n_hashed": len(names),
+        "gpu_bytes": total,
+        "all_tensors_sha256": digest,
+        "sample_sha256": sample,
+        "tensors": res,
+        "elapsed_s": round(time.time() - t0, 1),
+        "pinned_loader": os.environ.get("IMPALA_PINNED_LOADER", "0"),
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"wchk-rank{rank}-{os.getpid()}.json")
+    with open(path + ".tmp", "w") as f:
+        json.dump(report, f, indent=0)
+    os.replace(path + ".tmp", path)
+    logger.info(
+        "[impala-checksum] rank %d: %d tensors, %.1f GiB hashed, all-tensors sha256 %s (%.1f s) -> %s",
+        rank, len(names), total / 1024**3, digest[:16], time.time() - t0, path,
+    )

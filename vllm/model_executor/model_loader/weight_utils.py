@@ -1035,6 +1035,66 @@ def multi_thread_safetensors_weights_iterator(
                 yield key, state_dict.pop(key)
 
 
+_IMPALA_PINNED_VERSION = 2
+
+
+def _impala_pin_streamer_buffer(streamer) -> int | None:
+    """Experiment 4 (Impala): page-lock the Run:ai streamer's CPU staging buffer so that host->device copies out of it are
+    DMA (pinned) copies. Returns the registered address (for cudaHostUnregister) or None if the stock path stays."""
+    import ctypes
+    import threading
+    import time
+
+    try:
+        buf = streamer.file_streamer.file_streamer.requests_iterator.buffer  # np.ndarray[uint8]
+    except AttributeError as e:
+        logger.warning("[impala-pinned] streamer buffer not found (%s); staying on the pageable path", e)
+        return None
+    nbytes = int(buf.nbytes)
+    if nbytes == 0:
+        return None
+    addr = int(buf.ctypes.data)
+    t0 = time.time()
+    try:
+        # populate the pages in parallel without touching their content (the streamer threads may already be writing)
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        page = 4096
+        madv_populate_write = 23
+        madv_hugepage = 14
+        start = addr & ~(page - 1)
+        end = (addr + nbytes + page - 1) & ~(page - 1)
+        if os.environ.get("IMPALA_PINNED_THP", "1") == "1":
+            libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(end - start), madv_hugepage)
+        nthreads = max(1, int(os.environ.get("IMPALA_PINNED_TOUCH_THREADS", "16")))
+        step = (((end - start) // nthreads) + page - 1) & ~(page - 1)
+
+        def _touch(a: int, b: int) -> None:
+            libc.madvise(ctypes.c_void_p(a), ctypes.c_size_t(b - a), madv_populate_write)
+
+        ths = [
+            threading.Thread(target=_touch, args=(a, min(a + step, end)))
+            for a in range(start, end, step)
+        ]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join()
+        t1 = time.time()
+        rc = torch.cuda.cudart().cudaHostRegister(addr, nbytes, 0)
+        t2 = time.time()
+        if int(rc) != 0:
+            logger.warning("[impala-pinned] cudaHostRegister rc=%s; staying on the pageable path", rc)
+            return None
+        logger.info(
+            "[impala-pinned] v%d streamer buffer %.1f GB page-locked (thp=%s): populate %.2f s, register %.2f s",
+            _IMPALA_PINNED_VERSION, nbytes / 1e9, os.environ.get("IMPALA_PINNED_THP", "1"), t1 - t0, t2 - t1,
+        )
+        return addr
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[impala-pinned] pinning failed (%s); staying on the pageable path", e)
+        return None
+
+
 def runai_safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -1049,11 +1109,20 @@ def runai_safetensors_weights_iterator(
             else "cpu"
         )
 
+        _impala_pinned = os.environ.get("IMPALA_PINNED_LOADER", "0") == "1"
+        if _impala_pinned:
+            os.environ.setdefault(
+                "RUNAI_STREAMER_MEMORY_LIMIT",
+                os.environ.get("IMPALA_PINNED_BUFFER_BYTES", "40000000000"),
+            )
+            if is_cuda_alike and os.environ.get("IMPALA_PINNED_GPU_YIELD", "1") == "1":
+                device = f"cuda:{current_platform.current_device()}"
         streamer.stream_files(
             hf_weights_files,
             device=device,
             is_distributed=is_distributed,
         )
+        _impala_reg = _impala_pin_streamer_buffer(streamer) if _impala_pinned else None
         total_tensors = sum(
             len(tensors_meta)
             for tensors_meta in streamer.files_to_tensors_metadata.values()
@@ -1068,7 +1137,11 @@ def runai_safetensors_weights_iterator(
             mininterval=2,
         )
 
-        yield from tensor_iter
+        try:
+            yield from tensor_iter
+        finally:
+            if _impala_reg is not None:
+                torch.cuda.cudart().cudaHostUnregister(_impala_reg)
 
 
 def _init_fastsafetensors_loader(
