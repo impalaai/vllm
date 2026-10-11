@@ -1208,6 +1208,66 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
 
 
+def _impala_reload_fix_enabled() -> bool:
+    """Experiment 5 (Impala): IMPALA_RELOAD_FIX=1 enables the in-place reload fixes."""
+    import os as _os
+
+    return _os.environ.get("IMPALA_RELOAD_FIX", "0") == "1"
+
+
+def _impala_overlap_copy_(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """copy_ that tolerates an expanded (stride-0) destination: write its unique storage elements once."""
+    if torch._debug_has_internal_overlap(dst) == 0:
+        dst.copy_(src)
+        return
+    n = dst.untyped_storage().nbytes() // dst.element_size()
+    dst_flat = torch.as_strided(dst, (n,), (1,), 0)
+    if src.shape == dst.shape and src.stride() == dst.stride() and src.untyped_storage().nbytes() == dst.untyped_storage().nbytes():
+        src_flat = torch.as_strided(src, (n,), (1,), 0)
+    else:
+        idx = tuple(0 if st == 0 else slice(None) for st in dst.stride())
+        src_flat = src[idx].contiguous().reshape(-1)
+        if src_flat.numel() != n:
+            raise RuntimeError(f"overlap copy: dst storage {n} elements, src sub-view {src_flat.numel()}")
+        if not torch.equal(src, src[idx].expand_as(src)):
+            raise RuntimeError("overlap copy: source is not uniform along the destination's stride-0 dims")
+    dst_flat.copy_(src_flat)
+
+
+def _impala_refresh_quant_config_inplace(old_qc, new_qc, layer: torch.nn.Module) -> None:
+    """Experiment 5 (Impala): copy every tensor of the freshly built fused-MoE quant config into the tensor the LIVE quant
+    config references (same object the captured kernels read). Parameters of the layer are refreshed again by the
+    layerwise machinery afterwards (harmless). A shape/dtype mismatch rebinds the field and warns (graphs would be stale)."""
+    n_copied = n_same = n_rebound = 0
+    for desc_name in ("_a1", "_a2", "_w1", "_w2"):
+        od = getattr(old_qc, desc_name, None)
+        nd = getattr(new_qc, desc_name, None)
+        if od is None or nd is None:
+            continue
+        for field in list(vars(od).keys()):
+            ov = getattr(od, field, None)
+            nv = getattr(nd, field, None)
+            if not (isinstance(ov, torch.Tensor) and isinstance(nv, torch.Tensor)):
+                continue
+            if ov is nv:
+                n_same += 1
+                continue
+            if ov.shape == nv.shape and ov.dtype == nv.dtype and ov.device == nv.device:
+                _impala_overlap_copy_(ov, nv)
+                n_copied += 1
+            else:
+                logger.warning(
+                    "[impala-reload] %s.%s: shape/dtype changed on reload (%s/%s -> %s/%s); rebinding (captured graphs stale)",
+                    desc_name, field, tuple(ov.shape), ov.dtype, tuple(nv.shape), nv.dtype,
+                )
+                object.__setattr__(od, field, nv)
+                n_rebound += 1
+    logger.info_once(
+        "[impala-reload] fused-MoE quant config refreshed in place: %d tensors copied, %d shared, %d rebound",
+        n_copied, n_same, n_rebound,
+    )
+
+
 class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
     """
     MoE Method for FP4 Quantization.
@@ -1412,16 +1472,32 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         replace_parameter(layer, "w2_input_scale", a2_scale)
 
         # Setup modular kernel.
-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        _impala_old_kernel = getattr(self, "moe_kernel", None)
+        _impala_old_qc = getattr(self, "moe_quant_config", None)
+        new_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.experts_cls is not None
-        self.moe_kernel = make_nvfp4_moe_kernel(
-            moe_quant_config=self.moe_quant_config,
+        new_kernel = make_nvfp4_moe_kernel(
+            moe_quant_config=new_quant_config,
             moe_config=self.moe,
             experts_cls=self.experts_cls,
             shared_experts=layer.shared_experts,
             routing_tables=layer._maybe_init_expert_routing_tables(),
         )
-        self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+        new_kernel.fused_experts.process_weights_after_loading(layer)
+        if (
+            _impala_reload_fix_enabled()
+            and _impala_old_kernel is not None
+            and _impala_old_qc is not None
+        ):
+            # Experiment 5 (Impala): a RELOAD. Keep the kernel the CUDA graphs were captured with and refresh its
+            # quant-config tensors in place (a1/a2_gscale are not layer parameters; the generic layerwise copy
+            # only covers parameters/buffers). The layer's parameters are copied back into their original
+            # storage by _copy_and_restore_kernel_tensors right after this returns.
+            _impala_refresh_quant_config_inplace(_impala_old_qc, new_quant_config, layer)
+            del new_kernel
+        else:
+            self.moe_quant_config = new_quant_config
+            self.moe_kernel = new_kernel
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
         return make_nvfp4_moe_quant_config(

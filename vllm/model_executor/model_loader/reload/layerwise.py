@@ -44,6 +44,26 @@ LAYERWISE_INFO: WeakKeyDictionary[torch.nn.Module, LayerReloadingInfo] = (
 )
 
 
+_IMPALA_PENDING: dict[int, tuple[torch.nn.Module, LayerReloadingInfo]] = {}
+
+
+def _impala_reload_fix_enabled() -> bool:
+    import os as _os
+
+    return _os.environ.get("IMPALA_RELOAD_FIX", "0") == "1"
+
+
+def _impala_flush_pending(except_info) -> None:
+    """Experiment 5 (Impala): process every ready layer except the one currently receiving loads."""
+    for key in list(_IMPALA_PENDING.keys()):
+        layer, info = _IMPALA_PENDING[key]
+        if info is except_info:
+            continue
+        del _IMPALA_PENDING[key]
+        if info.can_load():
+            _layerwise_process(layer, info)
+
+
 def get_layerwise_info(layer: torch.nn.Module) -> LayerReloadingInfo:
     """
     Get information related to restoring and layerwise processing. If no previous
@@ -121,6 +141,10 @@ def initialize_online_processing(layer: torch.nn.Module):
     # Track loading progress to determine when to process/copy
     info.load_numel = 0
     info.load_numel_total = get_layer_size(layer)
+    _measured = getattr(layer, "_impala_first_load_numel", None)
+    if _impala_reload_fix_enabled() and _measured:
+        # Experiment 5 (Impala): exact trigger total measured at the first load (see base_loader._impala_count_first_load)
+        info.load_numel_total = _measured
 
     # Wrap each parameter's weight loader
     # Note that nested wrapping will occur for shared tensors
@@ -175,6 +199,15 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
         )
 
         # Process and copy when all weights are loaded
+        if _impala_reload_fix_enabled():
+            # Experiment 5 (Impala): defer processing of a ready layer until a load for another layer arrives, so a
+            # count overshoot cannot drop this layer's late loads (see _IMPALA_PENDING).
+            _impala_flush_pending(except_info=info)
+            if info.load_numel >= info.load_numel_total and not isinstance(  # type: ignore[operator]
+                layer, (Attention, MLAAttention)
+            ):
+                _IMPALA_PENDING[id(info)] = (layer, info)
+            return ret
         if info.load_numel >= info.load_numel_total and not isinstance(  # type: ignore[operator]
             layer, (Attention, MLAAttention)
         ):
@@ -199,6 +232,8 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
     """
     if hasattr(model, "_original_do_torchao_reload"):
         model._do_torchao_reload = model._original_do_torchao_reload
+
+    _impala_flush_pending(except_info=None)
 
     deferred_attn: list[tuple[torch.nn.Module, LayerReloadingInfo]] = []
 
@@ -348,11 +383,30 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
     assert info.kernel_tensors is not None
     parameters, buffers = info.kernel_tensors
     for name, param in parameters.items():
-        param.data.copy_(getattr(layer, name))
+        _impala_overlap_copy(param.data, getattr(layer, name), name)
     for name, buffer in buffers.items():
-        buffer.data.copy_(getattr(layer, name))
+        _impala_overlap_copy(buffer.data, getattr(layer, name), name)
 
     _place_kernel_tensors(layer, info)
+
+
+def _impala_overlap_copy(dst: torch.Tensor, src: torch.Tensor, name: str = "") -> None:
+    """copy_ that tolerates an expanded (stride-0) destination: write its unique storage elements once (Experiment 2/5)."""
+    if torch._debug_has_internal_overlap(dst) == 0:
+        dst.copy_(src)
+        return
+    n = dst.untyped_storage().nbytes() // dst.element_size()
+    dst_flat = torch.as_strided(dst, (n,), (1,), 0)
+    if src.shape == dst.shape and src.stride() == dst.stride() and src.untyped_storage().nbytes() == dst.untyped_storage().nbytes():
+        src_flat = torch.as_strided(src, (n,), (1,), 0)
+    else:
+        idx = tuple(0 if st == 0 else slice(None) for st in dst.stride())
+        src_flat = src[idx].contiguous().reshape(-1)
+        if src_flat.numel() != n:
+            raise RuntimeError(f"overlap copy for {name}: dst storage {n} elements, src sub-view {src_flat.numel()}")
+        if not torch.equal(src, src[idx].expand_as(src)):
+            raise RuntimeError(f"overlap copy for {name}: source is not uniform along the destination's stride-0 dims")
+    dst_flat.copy_(src_flat)
 
 
 def _place_kernel_tensors(layer: torch.nn.Module, info: LayerReloadingInfo):

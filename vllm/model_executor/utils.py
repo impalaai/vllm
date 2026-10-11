@@ -45,7 +45,10 @@ def set_weight_attrs(
 
 
 def replace_parameter(
-    layer: torch.nn.Module, param_name: str, new_data: torch.Tensor | None
+    layer: torch.nn.Module,
+    param_name: str,
+    new_data: torch.Tensor | None,
+    prefer_copy: bool = False,
 ):
     """
     Replace a parameter of a layer while maintaining the ability to reload the weight.
@@ -67,9 +70,20 @@ def replace_parameter(
 
     if isinstance(new_data, torch.nn.Parameter):
         new_data = new_data.data
-    new_param = torch.nn.Parameter(new_data, requires_grad=False)
 
     old_param: torch.nn.Parameter | None = getattr(layer, param_name, None)
+    # Experiment 5 (Impala) / upstream #40390: copy in place so captured CUDA graphs keep a valid pointer across reloads
+    if (
+        prefer_copy
+        and old_param is not None
+        and old_param.shape == new_data.shape
+        and old_param.dtype == new_data.dtype
+        and old_param.device == new_data.device
+    ):
+        old_param.copy_(new_data)
+        return
+
+    new_param = torch.nn.Parameter(new_data, requires_grad=False)
     if old_param is not None and hasattr(old_param, "weight_loader"):
         weight_loader = old_param.weight_loader
         set_weight_attrs(new_param, {"weight_loader": weight_loader})

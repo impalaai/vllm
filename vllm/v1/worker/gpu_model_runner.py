@@ -391,6 +391,19 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
 
 
+def _impala_kv_tensor_pool(vllm_config):
+    """Experiment 5 (Impala) / upstream #59158: with the reload fix on, the worker runs initialize_kv_cache inside a "runtime"
+    pool (backed up on sleep); only the KV tensors themselves go into the discardable "kv_cache" pool (nested)."""
+    import os as _os
+    from contextlib import nullcontext
+
+    if _os.environ.get("IMPALA_RELOAD_FIX", "0") != "1" or not vllm_config.model_config.enable_sleep_mode:
+        return nullcontext()
+    from vllm.device_allocator.cumem import CuMemAllocator
+
+    return CuMemAllocator.get_instance().use_memory_pool(tag="kv_cache")
+
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -6839,9 +6852,10 @@ class GPUModelRunner(
 
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
-        kv_caches = self.initialize_kv_cache_tensors(
-            kv_cache_config, kernel_block_sizes
-        )
+        with _impala_kv_tensor_pool(self.vllm_config):
+            kv_caches = self.initialize_kv_cache_tensors(
+                kv_cache_config, kernel_block_sizes
+            )
 
         if (
             self.speculative_config

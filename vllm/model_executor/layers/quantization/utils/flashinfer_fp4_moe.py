@@ -34,6 +34,20 @@ __all__ = [
 ]
 
 
+def _impala_reload_fix_enabled() -> bool:
+    """Experiment 5 (Impala): IMPALA_RELOAD_FIX=1 enables the in-place reload fixes."""
+    import os as _os
+
+    return _os.environ.get("IMPALA_RELOAD_FIX", "0") == "1"
+
+
+def _impala_broadcast_scale(scalar: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Shared per-expert scale: a writable `.repeat` under the reload fix (upstream #49489), stock stride-0 `.expand` otherwise."""
+    if _impala_reload_fix_enabled():
+        return scalar.repeat(num_experts)
+    return scalar.expand(num_experts)
+
+
 def is_flashinfer_fp4_cutlass_moe_available() -> bool:
     """Return `True` when FlashInfer CUTLASS NV-FP4 kernels can be used."""
     return (
@@ -108,8 +122,8 @@ def prepare_nvfp4_moe_layer_for_flashinfer_cutedsl(
 
     # Global scaling factors (same as other FlashInfer backends).
     num_experts = w13.shape[0]
-    a13_scale = a13_scale.max().to(torch.float32).expand(num_experts)
-    a2_scale = a2_scale.max().to(torch.float32).expand(num_experts)
+    a13_scale = _impala_broadcast_scale(a13_scale.max().to(torch.float32), num_experts)
+    a2_scale = _impala_broadcast_scale(a2_scale.max().to(torch.float32), num_experts)
 
     half = w13.shape[1] // 2
     w13 = torch.cat([w13[:, half:], w13[:, :half]], dim=1)
@@ -335,8 +349,8 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
     # For some FI kernels, the input scales are shared by all experts.
     if is_global_sf_supported_for_nvfp4_backend(backend):
         num_experts = w13.shape[0]
-        a13_scale = a13_scale.max().to(torch.float32).expand(num_experts)
-        a2_scale = a2_scale.max().to(torch.float32).expand(num_experts)
+        a13_scale = _impala_broadcast_scale(a13_scale.max().to(torch.float32), num_experts)
+        a2_scale = _impala_broadcast_scale(a2_scale.max().to(torch.float32), num_experts)
     else:
         a13_scale = a13_scale.max(dim=1).values.to(torch.float32)
 

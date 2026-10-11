@@ -102,6 +102,13 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
+def _impala_runtime_tag() -> str:
+    """Experiment 5 (Impala): "runtime" (offloaded on sleep) under IMPALA_RELOAD_FIX=1, stock "kv_cache" otherwise."""
+    import os as _os
+
+    return "runtime" if _os.environ.get("IMPALA_RELOAD_FIX", "0") == "1" else "kv_cache"
+
+
 class Worker(WorkerBase):
     def __init__(
         self,
@@ -167,7 +174,11 @@ class Worker(WorkerBase):
             }
 
         allocator = CuMemAllocator.get_instance()
-        allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+        if _impala_runtime_tag() == "runtime":
+            # Experiment 5 (Impala) / upstream #59158: KV-init runtime state is kept at every level
+            allocator.sleep(offload_tags=("weights", "runtime") if level == 1 else ("runtime",))
+        else:
+            allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
@@ -327,6 +338,44 @@ class Worker(WorkerBase):
 
     def reload_weights(self, *args, **kwargs) -> None:
         self.model_runner.reload_weights(*args, **kwargs)
+
+    def impala_zero_kv_cache(self) -> str:
+        """Experiment 5 (Impala, diagnostic): zero every KV cache tensor (after wake_up the remapped pages hold leftovers)."""
+        n = 0
+        for t in getattr(self.model_runner, "kv_caches", []) or []:
+            if isinstance(t, torch.Tensor) and t.numel() > 0:
+                t.zero_()
+                n += t.numel() * t.element_size()
+        torch.cuda.synchronize()
+        return f"zeroed {n / 2**30:.1f} GiB"
+
+    def impala_memory_stats(self) -> str:
+        """Experiment 5 (Impala, diagnostic): allocator state + KV cache bytes bound (json)."""
+        import json as _json
+
+        st = torch.cuda.memory_stats()
+        free, total = torch.cuda.mem_get_info()
+        kv = sum(t.numel() * t.element_size() for t in (getattr(self.model_runner, "kv_caches", []) or []) if isinstance(t, torch.Tensor))
+        keys = ("allocated_bytes.all.current", "reserved_bytes.all.current", "inactive_split_bytes.all.current",
+                "segment.all.current", "num_alloc_retries", "num_ooms", "active_bytes.all.current")
+        out = {k: int(st.get(k, -1)) for k in keys}
+        out.update({"kv_cache_bytes": int(kv), "device_used_bytes": int(total - free)})
+        return _json.dumps(out)
+
+    def impala_empty_cache(self) -> str:
+        """Experiment 5 (Impala, diagnostic): torch.cuda.empty_cache(); returns reserved bytes before/after."""
+        before = int(torch.cuda.memory_stats().get("reserved_bytes.all.current", -1))
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        after = int(torch.cuda.memory_stats().get("reserved_bytes.all.current", -1))
+        return f"reserved {before / 2**30:.1f} -> {after / 2**30:.1f} GiB"
+
+    def impala_weight_checksum(self, tag: str = "rpc") -> str:
+        """Experiment 5 (Impala): write the weight/derived-tensor checksum report (IMPALA_WEIGHT_CHECKSUM=<dir>) via RPC."""
+        from vllm.model_executor.model_loader.base_loader import _impala_weight_checksum
+
+        torch.cuda.synchronize()
+        return _impala_weight_checksum(self.model_runner.model, tag=str(tag)) or ""
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -532,7 +581,7 @@ class Worker(WorkerBase):
             from vllm.device_allocator.cumem import CuMemAllocator
 
             allocator = CuMemAllocator.get_instance()
-            with allocator.use_memory_pool(tag="kv_cache"):
+            with allocator.use_memory_pool(tag=_impala_runtime_tag()):
                 self.model_runner.initialize_kv_cache(kv_cache_config)
         else:
             self.model_runner.initialize_kv_cache(kv_cache_config)

@@ -320,6 +320,27 @@ def _detect_output_quant_key(
     return kFp8StaticTensorSym
 
 
+def _impala_reload_fix_enabled() -> bool:
+    """Experiment 5 (Impala): IMPALA_RELOAD_FIX=1 enables the in-place reload fixes."""
+    import os as _os
+
+    return _os.environ.get("IMPALA_RELOAD_FIX", "0") == "1"
+
+
+def _impala_set_absorbed(layer: nn.Module, name: str, value: torch.Tensor) -> None:
+    """Experiment 5 (Impala) / upstream #48251: under the reload fix the absorbed MLA weights are parameters that a reload
+    refreshes IN PLACE (the captured bmm keeps its pointer); stock behaviour rebinds a fresh tensor."""
+    if not _impala_reload_fix_enabled():
+        setattr(layer, name, value)
+        return
+    from vllm.model_executor.utils import replace_parameter
+
+    old = getattr(layer, name, None)
+    if old is not None and not isinstance(old, nn.Parameter):
+        delattr(layer, name)
+    replace_parameter(layer, name, value, prefer_copy=True)
+
+
 class MLAAttention(nn.Module, AttentionLayerBase):
     """Multi-Head Latent Attention layer.
 
@@ -898,9 +919,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
         else:
             # Convert from (L, N, V) to (N, L, V)
-            self.W_UV = W_UV.transpose(0, 1)
+            _impala_set_absorbed(self, "W_UV", W_UV.transpose(0, 1))
             # Convert from (L, N, P) to (N, P, L)
-            self.W_UK_T = W_UK.permute(1, 2, 0)
+            _impala_set_absorbed(self, "W_UK_T", W_UK.permute(1, 2, 0))
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]

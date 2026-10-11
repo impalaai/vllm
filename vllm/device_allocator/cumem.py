@@ -87,6 +87,17 @@ def use_memory_pool_with_allocator(
         yield mem_pool, new_alloc
 
 
+def _impala_pin_backup() -> bool:
+    """Experiment 5 (Impala): pageable CPU backups under the reload fix (IMPALA_SLEEP_PAGEABLE_BACKUP=1 default) so a
+    checkpointed sleeping process carries no cudaHostAlloc'd pages; stock pinned backups otherwise."""
+    import os as _os
+
+    fix = _os.environ.get("IMPALA_RELOAD_FIX", "0") == "1"
+    if _os.environ.get("IMPALA_SLEEP_PAGEABLE_BACKUP", "1" if fix else "0") == "1":
+        return False
+    return is_pin_memory_available()
+
+
 class CuMemAllocator:
     """
     A singleton class that manages a memory pool for CUDA tensors.
@@ -199,7 +210,7 @@ class CuMemAllocator:
                     size_in_bytes,
                     dtype=torch.uint8,
                     device="cpu",
-                    pin_memory=is_pin_memory_available(),
+                    pin_memory=_impala_pin_backup(),
                 )
                 cpu_ptr = cpu_backup_tensor.data_ptr()
                 libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
